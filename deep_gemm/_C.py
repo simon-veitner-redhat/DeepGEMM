@@ -517,6 +517,10 @@ m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
 m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
 
+def get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk):
+    return _torch_ops.get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk)
+
+
 def bf16_mega_gate(
     x,
     weight,
@@ -679,7 +683,7 @@ _PUBLIC_API = [
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',
     'nvfp4_mega_moe',
-    'bf16_mega_gate',
+    'get_bf16_mega_gate_config', 'bf16_mega_gate',
     # FP8/FP4 GEMMs
     'fp8_fp4_gemm_nt', 'fp8_fp4_gemm_nn',
     'fp8_fp4_gemm_tn', 'fp8_fp4_gemm_tt',

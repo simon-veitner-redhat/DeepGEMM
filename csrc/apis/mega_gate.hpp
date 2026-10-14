@@ -179,10 +179,33 @@ bf16_mega_gate(const torch::Tensor& x,
     return {topk_idx, topk_weights};
 }
 
+// The config `bf16_mega_gate` picks for these shapes on the current SM count and deterministic mode;
+// the returned fields are the ones that select a JIT kernel variant
+static c10::Dict<std::string, int64_t> get_bf16_mega_gate_config(const int& num_tokens, const int& hidden,
+                                                                  const int& num_routed_experts, const int& num_topk) {
+    DG_HOST_ASSERT(num_tokens > 0 and num_tokens <= static_cast<int>(mega_gate_layout::kNumMaxTokens));
+    DG_HOST_ASSERT(hidden > 0 and hidden % 256 == 0);
+    DG_HOST_ASSERT(num_routed_experts > 0 and num_routed_experts <= 512 and
+                   num_routed_experts % static_cast<int>(mega_gate_layout::kNumExpertsPerLaneVector) == 0);
+    DG_HOST_ASSERT(num_topk > 0 and num_topk <= num_routed_experts and num_topk <= 32);
+    const auto config = get_mega_gate_config(num_tokens, hidden, num_routed_experts, runtime->get_num_sms());
+    c10::Dict<std::string, int64_t> result;
+    result.insert("num_gate_threads", config.num_gate_threads);
+    result.insert("num_mma_ctas", config.num_mma_ctas);
+    result.insert("num_split_k", config.num_split_k);
+    result.insert("num_expert_groups", config.num_expert_groups);
+    return result;
+}
+
 } // namespace deep_gemm::mega_gate
 
 namespace deep_gemm::torch_registration {
 using namespace deep_gemm::torch_utils;
+
+static c10::Dict<std::string, int64_t> get_bf16_mega_gate_config(const int64_t& num_tokens, const int64_t& hidden,
+                                                                  const int64_t& num_routed_experts, const int64_t& num_topk) {
+    return mega_gate::get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk);
+}
 
 static void bf16_mega_gate(const torch::Tensor& x,
                const torch::Tensor& weight,
@@ -209,7 +232,12 @@ static void bf16_mega_gate(const torch::Tensor& x,
 } // namespace deep_gemm::torch_registration
 
 TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("get_bf16_mega_gate_config(int num_tokens, int hidden, int num_routed_experts, int num_topk) -> Dict(str, int)");
     m.def("bf16_mega_gate(Tensor x, Tensor weight, int num_topk, bool use_shared_as_routed, int num_shared_experts, float routed_scaling_factor, int ep_rank, str scoring_func, Tensor? mask, Tensor? bias, Tensor? image_bias, Tensor? image_token_mask, Tensor? fix_routing_mask, Tensor? to_physical_map, Tensor? logical_count, Tensor(c!)? unmapped_topk_idx, Tensor? force_random, Tensor(a!) topk_idx, Tensor(b!) topk_weights) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(deep_gemm, CatchAll, m) {
+    m.impl("get_bf16_mega_gate_config", TORCH_FN(deep_gemm::torch_registration::get_bf16_mega_gate_config));
 }
 
 TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
