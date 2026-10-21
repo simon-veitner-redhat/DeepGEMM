@@ -111,6 +111,14 @@ CUTLASS_DEVICE void fence_acq_rel_cta() {
     asm volatile("fence.acq_rel.cta;" ::: "memory");
 }
 
+CUTLASS_DEVICE void fence_acq_rel_cluster() {
+    asm volatile("fence.acq_rel.cluster;" ::: "memory");
+}
+
+CUTLASS_DEVICE void fence_proxy_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
@@ -254,13 +262,13 @@ CUTLASS_DEVICE uint32_t ld_global_cg(const uint32_t* ptr) {
 
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     uint64_t ret;
-    asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
     return ret;
 }
 
 CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
     uint32_t ret;
-    asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
     return ret;
 }
 
@@ -295,7 +303,7 @@ CUTLASS_DEVICE uint64_t atomic_add(const uint64_t* ptr, const uint64_t& value) {
 
 CUTLASS_DEVICE uint64_t atomic_add_sys(const uint64_t* ptr, const uint64_t& value) {
     uint64_t ret;
-    asm volatile("atom.sys.global.add.u64 %0, [%1], %2;" : "=l"(ret) : "l"(ptr), "l"(value));
+    asm volatile("atom.sys.global.add.u64 %0, [%1], %2;" : "=l"(ret) : "l"(ptr), "l"(value) : "memory");
     return ret;
 }
 
@@ -334,7 +342,7 @@ CUTLASS_DEVICE void st_rel_sys(const uint64_t* ptr, const uint64_t& value) {
 }
 
 CUTLASS_DEVICE void red_add_rel(const uint32_t* ptr, const uint32_t& value) {
-    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value));
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
 }
 
 CUTLASS_DEVICE void red_async_inc_rel(const uint64_t* ptr) {
@@ -342,12 +350,12 @@ CUTLASS_DEVICE void red_async_inc_rel(const uint64_t* ptr) {
 }
 
 CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
-    asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
+    asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
 }
 
 CUTLASS_DEVICE int ld_acq_sys(const int* ptr) {
     int ret;
-    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
     return ret;
 }
 

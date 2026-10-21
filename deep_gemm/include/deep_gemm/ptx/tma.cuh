@@ -73,7 +73,7 @@ CUTLASS_DEVICE void mbarrier_wait_and_flip_phase(
         "DONE: \n\t"
         "}" ::
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
-        "r"(phase), "r"(0x989680));
+        "r"(phase), "r"(0x989680) : "memory");
     phase ^= 1;
 }
 

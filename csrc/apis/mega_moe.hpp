@@ -17,6 +17,7 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -288,9 +289,11 @@ static void fp8_fp4_mega_moe(
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
     // Config checks
+    // NOTES: on SM90, the recipe is the activation granularity only, weight SF keep the per-32 packed layout
+    const auto arch_major = jit->device.get_arch_major();
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == (arch_major == 9 ? 128 : 32));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swiglustep" or activation == "situ");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
@@ -311,7 +314,6 @@ static void fp8_fp4_mega_moe(
     }
 
     // Tensor checks
-    const auto arch_major = jit->device.get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
@@ -409,6 +411,27 @@ static void fp8_fp4_mega_moe(
             launch(sm100_fp8_fp4_mega_moe,
                    activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
         }
+    } else if (arch_major == 9) {
+        DG_HOST_ASSERT(activation != "situ");
+        DG_HOST_ASSERT(weight_dtype == kPackedFP4);
+        // NOTES: FP8 shared weights need 4 equal exponent bytes per SF word, see `requantize_fp8_weights_for_sm90_mega_moe`
+        sm90_fp8_fp4_mega_moe(y,
+                              l1_acts, l1_acts_sf,
+                              l2_acts, l2_acts_sf,
+                              shared_l1_acts, shared_l1_acts_sf,
+                              shared_l2_acts, shared_l2_acts_sf,
+                              l1_weights, l2_weights,
+                              l1_weights_sf, l2_weights_sf,
+                              shared_l1_weights, shared_l2_weights,
+                              shared_l1_weights_sf, shared_l2_weights_sf,
+                              cumulative_local_expert_recv_stats,
+                              sym_buffer_ptrs,
+                              rank_idx, num_max_tokens_per_rank,
+                              num_experts_per_rank,
+                              num_shared_experts,
+                              num_tokens, num_topk,
+                              hidden, intermediate_hidden,
+                              activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

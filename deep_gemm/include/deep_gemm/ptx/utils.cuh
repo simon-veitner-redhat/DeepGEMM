@@ -27,11 +27,11 @@ CUTLASS_DEVICE uint64_t get_grid_idx() {
 }
 
 CUTLASS_DEVICE void sync_aligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
-    asm volatile("bar.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
+    asm volatile("bar.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads) : "memory");
 }
 
 CUTLASS_DEVICE void sync_unaligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
-    asm volatile("barrier.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
+    asm volatile("barrier.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads) : "memory");
 }
 
 template <typename dtype_t>
