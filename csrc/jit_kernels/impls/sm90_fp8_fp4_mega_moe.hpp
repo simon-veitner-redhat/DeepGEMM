@@ -51,7 +51,7 @@ static void sm90_fp8_fp4_mega_moe(
         MmaKind::MXFP8FP4, num_shared_experts);
 
     // Make tensormap
-    // NOTES: SF are int32 words per 128 K: activations use byte 0, routed weights the `transform_fp4_sf_for_sm90_mega_moe` encoding
+    // NOTES: SF are int32 words per 128 K: activations hold FP32 scales, routed weights the `transform_fp4_sf_for_sm90_mega_moe` encoding
     constexpr int kGranK = 32;
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const auto acts_desc = [&](const torch::stable::Tensor& t, const int& shape_k, const int& shape_m,
@@ -112,7 +112,8 @@ static void sm90_fp8_fp4_mega_moe(
     // Compile
     const auto kernel = jit->compile("sm90_fp8_fp4_mega_moe", std::format(R"(
 #define DG_NO_DEVICE_PRINTF
-#define DG_DEVICE_ASSERT(cond) DG_TRAP_ONLY_DEVICE_ASSERT(cond)
+// NOTES: `__builtin_unreachable` after the trap avoids ptxas spills in the math warps
+#define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) {{ asm("trap;"); __builtin_unreachable(); }} }} while (0)
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
