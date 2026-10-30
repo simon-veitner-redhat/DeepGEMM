@@ -60,7 +60,9 @@ static void sm90_fp8_fp4_mega_moe(
     };
     const auto sf_desc = [&](const torch::stable::Tensor& sf, const int& shape_mn, const int& shape_k,
                              const int& block_mn, const int& num_groups) {
-        return make_tma_sf_desc(cute::UMMA::Major::MN, sf, shape_mn, shape_k, block_mn, kGranK, num_groups, 0, 0, false,
+        // NOTES: FP32 activation SF have one scale per 128 K, routed weight SF one `transform_fp4_sf_for_sm90_mega_moe` word per 128 K
+        const bool is_fp32 = sf.scalar_type() == torch::headeronly::ScalarType::Float;
+        return make_tma_sf_desc(cute::UMMA::Major::MN, sf, shape_mn, shape_k, block_mn, is_fp32 ? kGranK * 4 : kGranK, num_groups, 0, 0, false,
                                 sf_smem_outer_dim, static_cast<int>(sf.stride(-1)));
     };
     // NOTES: packed FP4 weights are loaded as raw bytes, 64 bytes per 128-element K block
