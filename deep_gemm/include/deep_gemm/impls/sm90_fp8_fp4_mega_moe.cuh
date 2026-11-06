@@ -51,6 +51,13 @@ CUTLASS_DEVICE void fence_view_async_shared() {
 
 } // namespace ordered_ptx
 
+// One L1 output tile, handed from the math warps to the store warp
+struct L1StoreCommand {
+    uint32_t is_stop, is_shared;
+    uint32_t n_block_idx, n_cluster_idx;
+    uint32_t m_idx, block_idx, ring_block_idx, pool_block_idx;
+};
+
 // An 8-entry E4M3 lookup table of the FP4 (E2M1) magnitudes times `2 ^ (shift - 5)`, for `shift` in [0, 11]
 CUTLASS_DEVICE uint2 make_fp4_to_fp8_lut(const uint32_t& shift) {
     return {0x14100800u + shift * 0x08080800u, 0x24201c18u + shift * 0x08080808u};
@@ -89,6 +96,7 @@ template <
     float kActivationBeta,
     bool kFastMath,
     bool kPingPong,
+    bool kRoutedFP8,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -189,8 +197,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         return (idx % 32) * 4 + idx / 32;
     };
 
+    // Block weight SF (`kRoutedFP8`): tile `j` of 128 rows reads block row `j` for L2, and for L1 (64 gate and 64 up rows) block rows
+    // `j & ~1` (gate) and `(j & ~1) + 1` (up), see `transform_fp8_block_sf_for_sm90_mega_moe`. Each stage loads the box of 4 block rows holding them
+    DG_STATIC_ASSERT(not kRoutedFP8 or BLOCK_N == 128, "Block weight SF need tiles of one 128-row block");
+
     // MMA configs
-    // Always swap A/B, routed weights are dequantized into registers
+    // Always swap A/B, packed FP4 routed weights are dequantized into registers (RS-WGMMA)
+    // FP8 weights (shared experts, and routed experts with `kRoutedFP8`) are read from shared memory (SS-WGMMA)
     using WGMMA = typename mma::sm90::FP8MMARSSelector<BLOCK_M>::type;
     using SharedWGMMA = typename mma::sm90::FP8MMASelector<BLOCK_M>::type;
     using a_dtype_t = cutlass::float_e4m3_t;
@@ -210,6 +223,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kPingPong or (BLOCK_M <= 64 and kNumExperts / kNumRanks <= 64),
                      "Ping-pong needs the accumulators of 2 tiles in the 208 math registers");
     DG_STATIC_ASSERT(kNumPipelines <= kNumStages and kNumRowTiles <= 2, "Invalid ping-pong config");
+
+    // FP8 routed weights sit in shared memory, so BLOCK_M 128 needs no swap: each math warpgroup takes 64 tokens as WGMMA A and
+    // all 128 weight rows as WGMMA B. A thread then holds 2 tokens, whose 4 scale products fit behind the WGMMAs
+    constexpr bool kTokensOnM = kRoutedFP8 and BLOCK_M == 128;
+    DG_STATIC_ASSERT(not kTokensOnM or (kNumRowTiles == 1 and BLOCK_M == WGMMA::M * kNumMathWarpgroups and BLOCK_N == SharedWGMMA::N),
+                     "Each math warpgroup computes 64 tokens against the whole weight tile");
 
     // Swizzle configs
     constexpr uint32_t kSwizzleAMode = 128;
@@ -245,9 +264,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumMathWarpgroups][STORE_BLOCK_M_L2 * WGMMA::M];
         } smem_d[kNumPipelines];
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][BLOCK_M * BLOCK_K];
-        alignas(kSharedMemoryAlignment) uint8_t smem_b[kNumStages][BLOCK_N * (kHasShared ? kNumSharedWeightBytesPerRow : kNumWeightBytesPerRow)];
+        alignas(kSharedMemoryAlignment) uint8_t smem_b[kNumStages][BLOCK_N * (kHasShared or kRoutedFP8 ? kNumSharedWeightBytesPerRow : kNumWeightBytesPerRow)];
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M];
-        uint32_t smem_sfb[kNumStages][BLOCK_N];
+        uint32_t smem_sfb[kNumStages][kRoutedFP8 ? layout::kNumBlockSFStageWords : BLOCK_N];
         float4 amax_reduction[kNumMathWarps][BLOCK_M / 4];
         float4 peer_amax[kNumPipelines][kNumAmaxSlots][BLOCK_M / 4];
         task_info_t task_infos[kNumScheduleStages];
@@ -260,6 +279,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_empty_barriers[kNumScheduleStages];
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, peer_amax);
+    DG_STATIC_ASSERT(not kRoutedFP8 or (offsetof(SharedStorage, smem_sfb) % 128 == 0 and sizeof(SharedStorage::smem_sfb[0]) % 128 == 0),
+                     "Block weight SF TMA destinations must be 128-byte aligned");
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
     // Send buffers
@@ -310,6 +331,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
 
     // Task scheduler
+    constexpr uint32_t kNumTaskGroupMBlocks = kTokensOnM ? sched::kNumSM90TaskGroupMBlocks : 1;
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
@@ -317,7 +339,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks, /*kNumLocalityDomains=*/ 1,
-        kNumSharedExperts, false, kPingPong>(
+        kNumSharedExperts, false, kPingPong, kNumTaskGroupMBlocks>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -347,17 +369,22 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithMathBarrierIdx = 1;
     constexpr uint32_t kMathFullBarrierIdx = 2;
     constexpr uint32_t kMathWGBarrierStartIdx = 3;
+    constexpr uint32_t kL1StoreFullBarrierIdx = 5;
+    constexpr uint32_t kL1StoreEmptyBarrierIdx = 6;
+    constexpr uint32_t kNumL1StoreBarrierThreads = kNumMathThreads + 32;
 
     // NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
 
     // Adjust registers
+    // NOTES: FP8 routed weights hold no FP4 fragments, so BLOCK_M 128 fits above 64 local experts with a middle split
     constexpr bool kUseMoreMathRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreMathRegisters ? 48 : 96;
-    constexpr uint32_t kNumNonMathRegisters = kUseMoreMathRegisters ? 40 : 72;
-    constexpr uint32_t kNumMathRegisters = kUseMoreMathRegisters ? 208 : 168;
-    DG_STATIC_ASSERT(kUseMoreMathRegisters or BLOCK_M <= 64, "BLOCK_M > 64 does not fit into the reduced math registers");
+    constexpr bool kUseMiddleMathRegisters = kRoutedFP8 and not kUseMoreMathRegisters and BLOCK_M > 64;
+    constexpr uint32_t kNumDispatchRegisters = kUseMiddleMathRegisters ? 72 : (kUseMoreMathRegisters ? 48 : 96);
+    constexpr uint32_t kNumNonMathRegisters = kUseMiddleMathRegisters ? 48 : (kUseMoreMathRegisters ? 40 : 72);
+    constexpr uint32_t kNumMathRegisters = kUseMiddleMathRegisters ? 192 : (kUseMoreMathRegisters ? 208 : 168);
+    DG_STATIC_ASSERT(kUseMoreMathRegisters or kUseMiddleMathRegisters or BLOCK_M <= 64, "BLOCK_M > 64 does not fit into the reduced math registers");
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonMathRegisters * kNumNonMathThreads +
                      kNumMathRegisters * kNumMathThreads <= 64512,
@@ -383,7 +410,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // The weight descriptors split N into 2 halves, and their K is in bytes
         const uint32_t half_n = task_info.shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
         const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
-        if (task_info.is_shared()) {
+        // NOTES: a local for this test changes the code of `kRoutedFP8 = false` kernels
+        if (kRoutedFP8 or task_info.is_shared()) {
             tma::copy_nd<BLOCK_K, BLOCK_N, kSwizzleSharedBMode, shared_b_dtype_t, 4>(
                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), 1,
                 k_block_idx * BLOCK_K, half_n_idx, half_idx, expert_idx);
@@ -392,11 +420,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 1,
                 k_block_idx * kNumWeightBytesPerRow, half_n_idx, half_idx, expert_idx);
         }
-        tma::copy<BLOCK_N, 1, 0>(
-            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx],
-            n_idx, expert_idx * num_k_blocks + k_block_idx);
-        const uint32_t num_weight_bytes = BLOCK_N * (task_info.is_shared() ? kNumSharedWeightBytesPerRow : kNumWeightBytesPerRow);
-        return num_weight_bytes + static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
+        if constexpr (kRoutedFP8) {
+            // The box of block rows `[j & ~3, (j & ~3) + 4)` of tile `j`
+            tma::copy<layout::kNumBlockSFWords, 1, 0>(
+                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx],
+                n_block_idx & ~(layout::kNumBlockSFWords - 1), expert_idx * num_k_blocks + k_block_idx);
+        } else {
+            tma::copy<BLOCK_N, 1, 0>(
+                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx],
+                n_idx, expert_idx * num_k_blocks + k_block_idx);
+        }
+        const uint32_t num_weight_bytes = BLOCK_N * (kRoutedFP8 or task_info.is_shared() ? kNumSharedWeightBytesPerRow : kNumWeightBytesPerRow);
+        const uint32_t num_sf_bytes = kRoutedFP8 ? layout::kNumBlockSFWords * static_cast<uint32_t>(sizeof(uint32_t))
+                                                 : static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
+        return num_weight_bytes + num_sf_bytes;
     };
 
     // Different warp roles
@@ -608,6 +645,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(ring_block_idx);
+                // NOTES: with tokens on M this wait is long, so it polls without the L1 invalidation of an acquire
+                if constexpr (kTokensOnM) {
+                    constexpr uint32_t kRingSlotPollSleepNs = 8000;
+                    while (ptx::ld_volatile(empty_ptr) < l1_empty_count_target)
+                        asm volatile("nanosleep.u32 %0;" :: "r"(kRingSlotPollSleepNs));
+                }
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
                 ptx::fence_proxy_async_global();
             }
@@ -823,6 +866,56 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Only joins the register deallocation of its warpgroup
         cutlass::arch::warpgroup_reg_dealloc<kNumNonMathRegisters>();
+
+        // With tokens on M, this warp ends the L1 epilogue, so that the math warps go on with the next task
+        if constexpr (kTokensOnM) {
+            // NOTES: tokens on M leaves `amax_reduction` unused: slot 1 hands over the token SF, slot 2 the command
+            const auto command = reinterpret_cast<const volatile L1StoreCommand*>(shared_storage.amax_reduction[2]);
+            const auto token_sf = reinterpret_cast<const uint32_t*>(shared_storage.amax_reduction[1]);
+            while (true) {
+                ordered_ptx::sync_aligned(kNumL1StoreBarrierThreads, kL1StoreFullBarrierIdx);
+                if (command->is_stop)
+                    break;
+                const bool is_shared = command->is_shared;
+                const uint32_t n_block_idx = command->n_block_idx, n_cluster_idx = command->n_cluster_idx, m_idx = command->m_idx;
+                const uint32_t block_idx = command->block_idx, ring_block_idx = command->ring_block_idx, pool_block_idx = command->pool_block_idx;
+
+                // Wait L2 block empty
+                if (not is_shared) {
+                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
+                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                    ptx::fence_proxy_async_global();
+                }
+
+                // Store FP32 SF into `l2_sf_buffer` or `shared_l2_sf_buffer` (MN-major), only by the leader CTA
+                if (is_leader_cta) {
+                    const auto sf_ptr = is_shared ?
+                        buffer.shared_l2_sf_buffer.get_base_ptr<uint32_t>() + n_cluster_idx * kNumSharedSFTokens :
+                        buffer.l2_sf_buffer.get_base_ptr<uint32_t>() + n_cluster_idx * kNumSFRingTokens;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < BLOCK_M / 32; ++ i)
+                        sf_ptr[block_idx * SF_BLOCK_M + transform_sf_token_idx(i * 32 + lane_idx)] = token_sf[i * 32 + lane_idx];
+                }
+                __syncwarp();
+
+                // TMA store, notify L2 and increment L1 empty count
+                if (lane_idx == 0) {
+                    const auto tensor_map_l1_output_ptr = is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output;
+                    cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, shared_storage.smem_d[0].l1, n_block_idx * L1_OUT_BLOCK_N, m_idx);
+                    cute::tma_store_arrive();
+                    ptx::tma_store_wait<0>();
+                    if (is_shared) {
+                        ordered_ptx::red_add_rel(workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
+                    } else {
+                        L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
+                        ordered_ptx::red_add_rel(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    }
+                }
+                __syncwarp();
+                asm volatile("bar.arrive %0, %1;" :: "r"(kL1StoreEmptyBarrierIdx), "r"(kNumL1StoreBarrierThreads) : "memory");
+            }
+        }
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonMathRegisters>();
@@ -859,16 +952,22 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Stage 0 addresses of the weight codes and SF word of row `row_idx`, pinned so that they are not recomputed per K block
         // The 16-byte chunk `quad_idx` of a 64-byte FP4 row holds one word per WGMMA, XOR-swizzled with `(row / 2) % 4 = lane_idx / 8`
         const auto pin = [](uint32_t x) { asm volatile("mov.b32 %0, %0;" : "+r"(x)); return x; };
-        const uint32_t weight_smem_addr = pin(static_cast<uint32_t>(__cvta_generic_to_shared(shared_storage.smem_b[0])) +
-                                              row_idx * kNumWeightBytesPerRow + (quad_idx ^ (lane_idx / 8)) * kNumBankGroupBytes);
-        const uint32_t sfb_smem_addr = pin(static_cast<uint32_t>(__cvta_generic_to_shared(shared_storage.smem_sfb[0] + transform_sf_token_idx(row_idx))));
+        const uint32_t weight_smem_addr = kRoutedFP8 ? 0u : pin(static_cast<uint32_t>(__cvta_generic_to_shared(shared_storage.smem_b[0])) +
+                                                                row_idx * kNumWeightBytesPerRow + (quad_idx ^ (lane_idx / 8)) * kNumBankGroupBytes);
+        const uint32_t sfb_smem_addr = pin(static_cast<uint32_t>(__cvta_generic_to_shared(
+            shared_storage.smem_sfb[0] + (kRoutedFP8 ? 0u : transform_sf_token_idx(row_idx)))));
         constexpr uint32_t kNumTileWeightBytes = WGMMA::M * kNumWeightBytesPerRow;
         constexpr uint32_t kNumTileSFBWords = WGMMA::M / 32;
 
+        // With tokens on M, the first of the 2 tokens of this thread (the second is 8 rows further) and its stage 0 SF address
+        const uint32_t token_idx = math_wg_idx * WGMMA::M + warp_idx_in_wg * 16 + lane_idx / 4;
+        const uint32_t sfa_smem_addr = kTokensOnM ? pin(static_cast<uint32_t>(__cvta_generic_to_shared(
+            shared_storage.smem_sfa[0] + transform_sf_token_idx(token_idx)))) : 0u;
+
         // Token and shared expert weight descriptors
-        auto b_desc = mma::sm90::make_smem_desc(shared_storage.smem_a[0],
+        auto b_desc = mma::sm90::make_smem_desc(shared_storage.smem_a[0] + (kTokensOnM ? math_wg_idx * WGMMA::M * BLOCK_K : 0u),
                                                 static_cast<int>(mma::sm90::to_gmma_layout_type<cute::UMMA::Major::K, kSwizzleAMode, a_dtype_t>()));
-        auto shared_a_desc = mma::sm90::make_smem_desc(shared_storage.smem_b[0] + first_row_tile_idx * WGMMA::M * kNumSharedWeightBytesPerRow,
+        auto shared_a_desc = mma::sm90::make_smem_desc(shared_storage.smem_b[0] + (kTokensOnM ? 0u : first_row_tile_idx * WGMMA::M * kNumSharedWeightBytesPerRow),
                                                        static_cast<int>(mma::sm90::to_gmma_layout_type<cute::UMMA::Major::K, kSwizzleSharedBMode, shared_b_dtype_t>()));
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
         const uint32_t shared_a_desc_lo = __shfl_sync(0xffffffff, shared_a_desc.reg32_[0], 0);
@@ -876,6 +975,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         // Ensure the math barrier cannot run with the pull barrier
         ordered_ptx::sync_unaligned(kNumDispatchThreads + kNumMathThreads, kDispatchWithMathBarrierIdx);
+
+        // Whether an L2 task may still stage in the L1 output tile buffer
+        bool is_l2_staging_dirty = false;
+
+        // Whether the store warp still reads the L1 output tile and its SF
+        bool is_l1_store_pending = false;
+        const auto wait_l1_store = [&]() {
+            if (is_l1_store_pending)
+                ordered_ptx::sync_aligned(kNumL1StoreBarrierThreads, kL1StoreEmptyBarrierIdx);
+            is_l1_store_pending = false;
+        };
 
         // Persistently schedule over blocks
         uint32_t num_linear1_tasks = 0;
@@ -907,7 +1017,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
                             ptx::warpgroup_fence_operand(accum[t][i]);
                         if (t + 1 < kNumRowTiles) {
-                            ptx::warpgroup_wait<kNumWGMMAsPerTile>();
+                            ptx::warpgroup_wait<kRoutedFP8 ? 1 : kNumWGMMAsPerTile>();
                         } else {
                             ptx::warpgroup_wait<0>();
                         }
@@ -927,98 +1037,203 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 };
 
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                    // Wait TMA arrivals unless the previous K block has seen them
-                    if (not next_full_ready)
-                        shared_storage.full_barriers[stage_idx].wait(phase);
+                // The block SF word offsets of the task, pinned so that they are not recomputed per K block
+                const uint32_t sfb_task_addr = kRoutedFP8 ?
+                    pin(sfb_smem_addr + ((task_info.n_cluster_idx * 2 + cta_rank_in_cluster) & (is_linear1 ? 2u : 3u)) * static_cast<uint32_t>(sizeof(uint32_t))) : 0u;
+                const uint32_t sfb_up_offset = kRoutedFP8 ? pin(is_linear1 ? static_cast<uint32_t>(sizeof(uint32_t)) : 0u) : 0u;
 
-                    // Weight SF words of both rows of every tile
-                    const uint32_t sfb_stage_addr = sfb_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
-                    #pragma unroll
-                    for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                        #pragma unroll
-                        for (uint32_t i = 0; i < 2; ++ i)
-                            sfb[t][i] = ptx::ld_shared_u32(sfb_stage_addr + static_cast<uint32_t>((t * kNumTileSFBWords + i * 32) * sizeof(uint32_t)));
+                // With tokens on M, a warpgroup without valid tokens only keeps the pipeline going, its accumulators stay zero
+                if constexpr (kTokensOnM) {
+                    if (math_wg_idx * WGMMA::M >= task_info.valid_m) {
+                        for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                            shared_storage.full_barriers[stage_idx].wait(phase);
+                            if (lane_idx == 0)
+                                shared_storage.empty_barriers[stage_idx].arrive();
+                        }
+                        return;
                     }
-                    const auto b_desc_base_lo = b_desc_lo + stage_idx * (sizeof(SharedStorage::smem_a[0]) / 16);
-                    if (is_shared) {
-                        // FP8 weights with 4 equal exponent bytes per SF word (see `requantize_fp8_weights_for_sm90_mega_moe`)
-                        float weight_scales[kNumRowTiles][2];
-                        #pragma unroll
-                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                            weight_scales[t][0] = __uint_as_float((sfb[t][0] & 0xffu) << 23);
-                            weight_scales[t][1] = __uint_as_float((sfb[t][1] & 0xffu) << 23);
-                        }
+                }
 
-                        // Issue WGMMAs
-                        const auto a_desc_base_lo = shared_a_desc_lo + stage_idx * (sizeof(SharedStorage::smem_b[0]) / 16);
-                        #pragma unroll
-                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                            #pragma unroll
-                            for (uint32_t k = 0; k < kNumWGMMAsPerTile; ++ k) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(accum[t][i]);
-                                ptx::warpgroup_arrive();
-                                shared_a_desc.reg32_[0] = a_desc_base_lo + t * kNumTileSharedADescUnits + k * WGMMA::K / 16;
-                                b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
-                                SharedNWGMMA::wgmma(shared_a_desc, b_desc, accum[t], k > 0);
-                                ptx::warpgroup_commit_batch();
-                            }
-                        }
-                        wait_and_promote([&](const uint32_t& t, const uint32_t& i, const float& token_scale) { return weight_scales[t][i] * token_scale; });
-                    } else {
-                        // FP4 weights with per-32 table shifts in the SF words (see `transform_fp4_sf_for_sm90_mega_moe`)
-                        const auto get_lut = [&](const uint32_t& t, const uint32_t& i, const uint32_t& k) {
-                            return make_fp4_to_fp8_lut((sfb[t][i] << (12 - 4 * k)) >> 28);
-                        };
+                // With tokens on M, the K loop is unrolled over the stages: barriers, descriptors and SF addresses are compile-time per stage,
+                // which leaves the WGMMA issue on the uniform datapath
+                if constexpr (kTokensOnM) {
+                    uint32_t k_block_idx = 0;
+                    const auto k_block = [&](const auto& stage_c) {
+                        constexpr uint32_t kStage = std::decay_t<decltype(stage_c)>::value;
+                        constexpr uint32_t kNextStage = (kStage + 1) % kNumStages;
 
-                        // Issue WGMMAs
-                        // The fragments of every tile stay in registers until the WGMMAs reading them complete
-                        const uint32_t weight_stage_addr = weight_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_b[0]));
-                        uint32_t a[kNumRowTiles][kNumWGMMAsPerTile][4];
-                        const auto issue = [&](const uint32_t& t, const uint32_t& k, const bool& do_fence) {
-                            if (do_fence) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(accum[t][i]);
-                                ptx::warpgroup_arrive();
-                            }
+                        // Wait TMA arrivals unless the previous K block has seen them
+                        if (not next_full_ready)
+                            shared_storage.full_barriers[kStage].wait(phase);
+
+                        // One block scale for the gate rows and one for the up rows (the same word for L2)
+                        const uint32_t sfb_stage_addr = sfb_task_addr + kStage * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
+                        const float weight_scales[2] = {__uint_as_float(ptx::ld_shared_u32(sfb_stage_addr)), __uint_as_float(ptx::ld_shared_u32(sfb_stage_addr + sfb_up_offset))};
+
+                        // Issue WGMMAs: each warpgroup takes its 64 tokens as A and the whole weight tile as B
+                        const uint32_t b_desc_base_lo = b_desc_lo + kStage * (sizeof(SharedStorage::smem_a[0]) / 16);
+                        const uint32_t a_desc_base_lo = shared_a_desc_lo + kStage * (sizeof(SharedStorage::smem_b[0]) / 16);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(accum[0][i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kNumWGMMAsPerTile; ++ k) {
                             b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
-                            NWGMMA::wgmma(a[t][k], b_desc, accum[t], k > 0);
-                            ptx::warpgroup_commit_batch();
-                        };
+                            shared_a_desc.reg32_[0] = a_desc_base_lo + k * WGMMA::K / 16;
+                            SharedNWGMMA::wgmma(b_desc, shared_a_desc, accum[0], k > 0);
+                        }
+                        ptx::warpgroup_commit_batch();
+
+                        // NOTES: tokens `i` and `i + 8` are 32 SF words apart, see `transform_sf_token_idx`
+                        const uint32_t sfa_stage_addr = sfa_smem_addr + kStage * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfa[0]));
+                        const float token_scales[2] = {__uint_as_float(ptx::ld_shared_u32(sfa_stage_addr)),
+                                                       __uint_as_float(ptx::ld_shared_u32(sfa_stage_addr + 32 * static_cast<uint32_t>(sizeof(uint32_t))))};
+                        const float scales[2][2] = {{weight_scales[0] * token_scales[0], weight_scales[1] * token_scales[0]},
+                                                    {weight_scales[0] * token_scales[1], weight_scales[1] * token_scales[1]}};
+                        next_full_ready = shared_storage.full_barriers[kNextStage].test_wait(phase ^ (kNextStage == 0));
                         #pragma unroll
-                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                            const uint32_t tile_weight_addr = weight_stage_addr + t * kNumTileWeightBytes;
-                            const uint4 codes[2] = {ptx::ld_shared_u32x4(tile_weight_addr), ptx::ld_shared_u32x4(tile_weight_addr + 8 * kNumWeightBytesPerRow)};
+                        for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(accum[0][i]);
+                        ptx::warpgroup_wait<0>();
+
+                        // Accumulator `i * 4 + j` is channel `8 * i + 2 * quad_idx + j % 2` of token `j / 2`, and the 8-row gate/up interleave
+                        // makes odd `i` the up channels
+                        #pragma unroll
+                        for (uint32_t i = 0; i < NWGMMA::kNumAccum / 4; ++ i) {
                             #pragma unroll
-                            for (uint32_t k = 0; k < kNumWGMMAsPerTile; ++ k) {
-                                dequant_fp4x8_to_fp8x8(reinterpret_cast<const uint32_t*>(&codes[0])[k], get_lut(t, 0, k), a[t][k][0], a[t][k][2]);
-                                dequant_fp4x8_to_fp8x8(reinterpret_cast<const uint32_t*>(&codes[1])[k], get_lut(t, 1, k), a[t][k][1], a[t][k][3]);
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                final_accum[0][i * 4 + j] = __fmaf_rn(accum[0][i * 4 + j], scales[j / 2][i % 2], final_accum[0][i * 4 + j]);
+                        }
+
+                        // Release the stage after all shared memory reads, see below
+                        ordered_ptx::fence_view_async_shared();
+                        __syncwarp();
+                        if (lane_idx == 0)
+                            shared_storage.empty_barriers[kStage].arrive();
+
+                        ++ k_block_idx;
+                        stage_idx = kNextStage;
+                        phase ^= kNextStage == 0;
+                    };
+                    const auto stage_pass = [&]<uint32_t... kStages>(std::integer_sequence<uint32_t, kStages...>) {
+                        ((stage_idx == kStages and k_block_idx < num_k_blocks ? k_block(cute::Int<kStages>{}) : void()), ...);
+                    };
+                    while (k_block_idx < num_k_blocks)
+                        stage_pass(std::make_integer_sequence<uint32_t, kNumStages>{});
+                } else {
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                        // Wait TMA arrivals unless the previous K block has seen them
+                        if (not next_full_ready)
+                            shared_storage.full_barriers[stage_idx].wait(phase);
+
+                        // Weight SF words of both rows of every tile
+                        if constexpr (kRoutedFP8) {
+                            // One block scale for the gate rows and one for the up rows (the same word for L2), shared by all tiles
+                            const uint32_t sfb_stage_addr = sfb_task_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
+                            const uint32_t sfb_gate = ptx::ld_shared_u32(sfb_stage_addr);
+                            const uint32_t sfb_up = ptx::ld_shared_u32(sfb_stage_addr + sfb_up_offset);
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                                sfb[t][0] = sfb_gate;
+                                sfb[t][1] = sfb_up;
+                            }
+                        } else {
+                            const uint32_t sfb_stage_addr = sfb_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]));
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
                                 #pragma unroll
-                                for (uint32_t i = 0; i < 4; ++ i)
-                                    ptx::warpgroup_fence_operand(a[t][k][i]);
-                                if constexpr (kNumRowTiles == 1)
-                                    issue(t, k, true);
+                                for (uint32_t i = 0; i < 2; ++ i)
+                                    sfb[t][i] = ptx::ld_shared_u32(sfb_stage_addr + static_cast<uint32_t>((t * kNumTileSFBWords + i * 32) * sizeof(uint32_t)));
+                            }
+                        }
+                        const auto b_desc_base_lo = b_desc_lo + stage_idx * (sizeof(SharedStorage::smem_a[0]) / 16);
+                        if (kRoutedFP8 or is_shared) {
+                            // FP8 weights with one scale per SF word: FP32, or 4 equal UE8M0 exponent bytes (see `requantize_fp8_weights_for_sm90_mega_moe`)
+                            float weight_scales[kNumRowTiles][2];
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                                if constexpr (kRoutedFP8) {
+                                    weight_scales[t][0] = __uint_as_float(sfb[t][0]);
+                                    weight_scales[t][1] = __uint_as_float(sfb[t][1]);
+                                } else {
+                                    weight_scales[t][0] = __uint_as_float((sfb[t][0] & 0xffu) << 23);
+                                    weight_scales[t][1] = __uint_as_float((sfb[t][1] & 0xffu) << 23);
+                                }
                             }
 
-                            // With two tiles, dequantize a whole tile before its WGMMAs, so that the next tile's dequantization overlaps them
+                            // Issue WGMMAs
+                            const auto a_desc_base_lo = shared_a_desc_lo + stage_idx * (sizeof(SharedStorage::smem_b[0]) / 16);
                             #pragma unroll
-                            for (uint32_t k = 0; k < kNumWGMMAsPerTile and kNumRowTiles > 1; ++ k)
-                                issue(t, k, k == 0);
-                        }
-                        wait_and_promote([](const uint32_t&, const uint32_t&, const float& token_scale) { return token_scale; });
-                    }
+                            for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                                #pragma unroll
+                                for (uint32_t k = 0; k < kNumWGMMAsPerTile; ++ k) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(accum[t][i]);
+                                    if (not kRoutedFP8 or k == 0)
+                                        ptx::warpgroup_arrive();
+                                    shared_a_desc.reg32_[0] = a_desc_base_lo + t * kNumTileSharedADescUnits + k * WGMMA::K / 16;
+                                    b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                                    SharedNWGMMA::wgmma(shared_a_desc, b_desc, accum[t], k > 0);
+                                    if (not kRoutedFP8 or k + 1 == kNumWGMMAsPerTile)
+                                        ptx::warpgroup_commit_batch();
+                                }
+                            }
+                            wait_and_promote([&](const uint32_t& t, const uint32_t& i, const float& token_scale) { return weight_scales[t][i] * token_scale; });
+                        } else {
+                            // FP4 weights with per-32 table shifts in the SF words (see `transform_fp4_sf_for_sm90_mega_moe`)
+                            const auto get_lut = [&](const uint32_t& t, const uint32_t& i, const uint32_t& k) {
+                                return make_fp4_to_fp8_lut((sfb[t][i] << (12 - 4 * k)) >> 28);
+                            };
 
-                    // Release the stage after all shared memory reads
-                    // NOTES: TMA (the async proxy) refills the stage, so the generic-proxy reads of its weight codes and SF words
-                    // need a proxy fence before the release (PTX ISA 9.7.10.28.2). Without it, a refill may land before a load
-                    // that is still in flight at the arrive reads its value
-                    ordered_ptx::fence_view_async_shared();
-                    __syncwarp();
-                    if (lane_idx == 0)
-                        shared_storage.empty_barriers[stage_idx].arrive();
+                            // Issue WGMMAs
+                            // The fragments of every tile stay in registers until the WGMMAs reading them complete
+                            const uint32_t weight_stage_addr = weight_smem_addr + stage_idx * static_cast<uint32_t>(sizeof(SharedStorage::smem_b[0]));
+                            uint32_t a[kNumRowTiles][kNumWGMMAsPerTile][4];
+                            const auto issue = [&](const uint32_t& t, const uint32_t& k, const bool& do_fence) {
+                                if (do_fence) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < NWGMMA::kNumAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(accum[t][i]);
+                                    ptx::warpgroup_arrive();
+                                }
+                                b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                                NWGMMA::wgmma(a[t][k], b_desc, accum[t], k > 0);
+                                ptx::warpgroup_commit_batch();
+                            };
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                                const uint32_t tile_weight_addr = weight_stage_addr + t * kNumTileWeightBytes;
+                                const uint4 codes[2] = {ptx::ld_shared_u32x4(tile_weight_addr), ptx::ld_shared_u32x4(tile_weight_addr + 8 * kNumWeightBytesPerRow)};
+                                #pragma unroll
+                                for (uint32_t k = 0; k < kNumWGMMAsPerTile; ++ k) {
+                                    dequant_fp4x8_to_fp8x8(reinterpret_cast<const uint32_t*>(&codes[0])[k], get_lut(t, 0, k), a[t][k][0], a[t][k][2]);
+                                    dequant_fp4x8_to_fp8x8(reinterpret_cast<const uint32_t*>(&codes[1])[k], get_lut(t, 1, k), a[t][k][1], a[t][k][3]);
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < 4; ++ i)
+                                        ptx::warpgroup_fence_operand(a[t][k][i]);
+                                    if constexpr (kNumRowTiles == 1)
+                                        issue(t, k, true);
+                                }
+
+                                // With two tiles, dequantize a whole tile before its WGMMAs, so that the next tile's dequantization overlaps them
+                                #pragma unroll
+                                for (uint32_t k = 0; k < kNumWGMMAsPerTile and kNumRowTiles > 1; ++ k)
+                                    issue(t, k, k == 0);
+                            }
+                            wait_and_promote([](const uint32_t&, const uint32_t&, const float& token_scale) { return token_scale; });
+                        }
+
+                        // Release the stage after all shared memory reads
+                        // NOTES: TMA (the async proxy) refills the stage, so the generic-proxy reads of its weight codes and SF words
+                        // need a proxy fence before the release (PTX ISA 9.7.10.28.2). Without it, a refill may land before a load
+                        // that is still in flight at the arrive reads its value
+                        ordered_ptx::fence_view_async_shared();
+                        __syncwarp();
+                        if (lane_idx == 0)
+                            shared_storage.empty_barriers[stage_idx].arrive();
+                    }
                 }
             };
 
@@ -1027,7 +1242,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             scheduler.release_task_info();
             // At BLOCK_M 16, the quarter is also the half
             constexpr uint32_t kQuarterN = cute::max(BLOCK_M / 4, 8u);
-            if (task_info.valid_m <= kQuarterN) {
+            if constexpr (kTokensOnM) {
+                // The tile shape does not depend on `valid_m`
+                mainloop(cute::Int<BLOCK_M>{});
+            } else if (task_info.valid_m <= kQuarterN) {
                 mainloop(cute::Int<kQuarterN>{});
             } else if (kQuarterN < BLOCK_M / 2 and task_info.valid_m <= BLOCK_M / 2) {
                 mainloop(cute::Int<BLOCK_M / 2>{});
@@ -1036,7 +1254,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Apply the per-row weight scales of routed experts
-            if (not is_shared) {
+            if (not kRoutedFP8 and not is_shared) {
                 #pragma unroll
                 for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
                     const float weight_scales[2] = {__uint_as_float((sfb[t][0] & 0xffu) << 23), __uint_as_float((sfb[t][1] & 0xffu) << 23)};
@@ -1056,102 +1274,50 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + cta_rank_in_cluster;
 
             if (is_linear1) {
-                // Wait L2 block empty
-                if (not is_shared) {
-                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
-                    ptx::fence_proxy_async_global();
+                // Wait L2 block empty, with tokens on M the store warp does it
+                if constexpr (not kTokensOnM) {
+                    if (not is_shared) {
+                        const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                        const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
+                        while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                        ptx::fence_proxy_async_global();
+                    }
                 }
 
                 // Apply SwiGLU and top-k weights (1 for shared experts): gate * sigmoid(alpha * gate) * (up + beta) * weight
-                float2 activations[kNumRowTiles][WGMMA::kNumAccum / 4];
-                #pragma unroll
-                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                    float2 weights = {1.0f, 1.0f};
-                    if (not is_shared)
-                        weights = *reinterpret_cast<const float2*>(buffer.l1_topk_weights_buffer.get_base_ptr<float>() + ring_m_idx + i * 8 + quad_idx * 2);
+                const auto apply_swiglu = [&](const float2& gate_accum, const float2& up_accum, const float2& weights) {
+                    auto bf16_gate = __float22bfloat162_rn(gate_accum);
+                    auto bf16_up = __float22bfloat162_rn(up_accum);
 
-                    #pragma unroll
-                    for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                        auto bf16_gate = __float22bfloat162_rn({final_accum[t][i * 4 + 0], final_accum[t][i * 4 + 1]});
-                        auto bf16_up = __float22bfloat162_rn({final_accum[t][i * 4 + 2], final_accum[t][i * 4 + 3]});
-
-                        // Clamp
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
-                            if constexpr (not kClampAfterSilu)
-                                bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
-                            bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
-                            bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
-                        }
-
-                        // SwiGLU
-                        const auto gate = __bfloat1622float2(bf16_gate);
-                        auto sigmoid_input = gate;
-                        if constexpr (kActivationAlpha != 1.0f)
-                            sigmoid_input = {sigmoid_input.x * kActivationAlpha, sigmoid_input.y * kActivationAlpha};
-                        const float2 neg_gate_exp = {
-                            kFastMath ? __expf(-sigmoid_input.x) : expf(-sigmoid_input.x),
-                            kFastMath ? __expf(-sigmoid_input.y) : expf(-sigmoid_input.y)};
-                        const float2 denom = {1.0f + neg_gate_exp.x, 1.0f + neg_gate_exp.y};
-                        float2 gated;
-                        if constexpr (kFastMath) {
-                            gated = {gate.x * math::fast_rcp(denom.x), gate.y * math::fast_rcp(denom.y)};
-                        } else {
-                            gated = {gate.x / denom.x, gate.y / denom.y};
-                        }
-                        if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
-                            gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
-                        auto up = __bfloat1622float2(bf16_up);
-                        if constexpr (kActivationBeta != 0.0f)
-                            up = {up.x + kActivationBeta, up.y + kActivationBeta};
-                        activations[t][i] = {gated.x * up.x * weights.x, gated.y * up.y * weights.y};
+                    // Clamp
+                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                        if constexpr (not kClampAfterSilu)
+                            bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
+                        bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
+                        bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                     }
-                }
 
-                // Reduce the per-token amax over the channels of the warp, then over the 64 channels of the CTA
-                #pragma unroll
-                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                    const auto reduce_amax = [&](const auto& get) {
-                        float amax = fabsf(get(activations[0][i]));
-                        #pragma unroll
-                        for (uint32_t t = 1; t < kNumRowTiles; ++ t)
-                            amax = fmaxf(amax, fabsf(get(activations[t][i])));
-                        return math::warp_reduce<4, true>(amax, math::ReduceMax<float>());
-                    };
-                    const float2 amax = {reduce_amax([](const float2& a) { return a.x; }), reduce_amax([](const float2& a) { return a.y; })};
-                    if (lane_idx < 4)
-                        ptx::st_shared(reinterpret_cast<float2*>(shared_storage.amax_reduction[math_warp_idx]) + i * 4 + lane_idx, amax);
-                }
-                sync_epilogue();
-
-                // Thread `t < BLOCK_M / 4` reduces tokens `4t` to `4t + 3`, and sends them to the same pipeline of the peer CTA
-                const auto amax_slot_idx = num_linear1_tasks % kNumAmaxSlots;
-                const auto amax_slot_phase = (num_linear1_tasks / kNumAmaxSlots) & 1;
-                auto& peer_amax_full_barrier = shared_storage.peer_amax_full_barriers[pipeline_idx][amax_slot_idx];
-                const auto peer_cta_idx = cta_rank_in_cluster ^ 1;
-                if (epilogue_thread_idx < BLOCK_M / 4) {
-                    float4 amax = ptx::ld_shared(&shared_storage.amax_reduction[first_epilogue_warp_idx][epilogue_thread_idx]);
-                    #pragma unroll
-                    for (uint32_t i = 1; i < kNumEpilogueThreads / 32; ++ i) {
-                        const auto other = ptx::ld_shared(&shared_storage.amax_reduction[first_epilogue_warp_idx + i][epilogue_thread_idx]);
-                        amax = {fmaxf(amax.x, other.x), fmaxf(amax.y, other.y), fmaxf(amax.z, other.z), fmaxf(amax.w, other.w)};
+                    // SwiGLU
+                    const auto gate = __bfloat1622float2(bf16_gate);
+                    auto sigmoid_input = gate;
+                    if constexpr (kActivationAlpha != 1.0f)
+                        sigmoid_input = {sigmoid_input.x * kActivationAlpha, sigmoid_input.y * kActivationAlpha};
+                    const float2 neg_gate_exp = {
+                        kFastMath ? __expf(-sigmoid_input.x) : expf(-sigmoid_input.x),
+                        kFastMath ? __expf(-sigmoid_input.y) : expf(-sigmoid_input.y)};
+                    const float2 denom = {1.0f + neg_gate_exp.x, 1.0f + neg_gate_exp.y};
+                    float2 gated;
+                    if constexpr (kFastMath) {
+                        gated = {gate.x * math::fast_rcp(denom.x), gate.y * math::fast_rcp(denom.y)};
+                    } else {
+                        gated = {gate.x / denom.x, gate.y / denom.y};
                     }
-                    shared_storage.amax_reduction[first_epilogue_warp_idx][epilogue_thread_idx] = amax;
-                    if (epilogue_thread_idx == 0)
-                        peer_amax_full_barrier.arrive_and_expect_tx(BLOCK_M * sizeof(float), peer_cta_idx);
-                    ptx::fence_acq_rel_cluster();
-                    ptx::st_async_cluster(&shared_storage.peer_amax[pipeline_idx][amax_slot_idx][epilogue_thread_idx], amax, peer_cta_idx, peer_amax_full_barrier);
-                }
-                sync_epilogue();
-                peer_amax_full_barrier.wait(amax_slot_phase);
-                ++ num_linear1_tasks;
-
-                // The 128-channel amax of token `i`
-                const auto get_amax = [&](const uint32_t& i) {
-                    const auto local_amax = reinterpret_cast<const float*>(shared_storage.amax_reduction[first_epilogue_warp_idx]);
-                    const auto peer_amax = reinterpret_cast<const float*>(shared_storage.peer_amax[pipeline_idx][amax_slot_idx]);
-                    return fmaxf(ptx::ld_shared(local_amax + i), ptx::ld_shared(peer_amax + i));
+                    if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
+                        gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
+                    auto up = __bfloat1622float2(bf16_up);
+                    if constexpr (kActivationBeta != 0.0f)
+                        up = {up.x + kActivationBeta, up.y + kActivationBeta};
+                    return float2{gated.x * up.x * weights.x, gated.y * up.y * weights.y};
                 };
 
                 // FP32 scale `amax / 448` and its inverse, both correctly rounded by one FMA refinement step
@@ -1164,50 +1330,185 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     return __fmaf_rn(__fmaf_rn(-sf, r, 1.0f), r, r);
                 };
 
-                // Cast into FP8 E4M3 and store into shared memory
-                const uint32_t channel_idx = first_row_tile_idx * (WGMMA::M / 2) + warp_idx_in_wg * 8 + lane_idx / 4;
-                #pragma unroll
-                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                    const uint32_t token_idx = i * 8 + quad_idx * 2;
-                    const float2 sf_inv = {get_sf_inv(get_sf(get_amax(token_idx))), get_sf_inv(get_sf(get_amax(token_idx + 1)))};
-                    #pragma unroll
-                    for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
-                        const auto fp8x2 = __nv_fp8x2_e4m3(make_float2(activations[t][i].x * sf_inv.x, activations[t][i].y * sf_inv.y));
+                if constexpr (kTokensOnM) {
+                    const auto amax_slot_idx = num_linear1_tasks % kNumAmaxSlots;
+                    const auto amax_slot_phase = (num_linear1_tasks / kNumAmaxSlots) & 1;
+                    auto& peer_amax_full_barrier = shared_storage.peer_amax_full_barriers[pipeline_idx][amax_slot_idx];
+                    const auto peer_cta_idx = cta_rank_in_cluster ^ 1;
+                    // NOTES: BLOCK_M 128 has no ping-pong, so there is one pipeline and `peer_amax[0]` is its slot
+                    // Thread tokens: `token_idx` and `token_idx + 8`, channels `8 * i + 2 * quad_idx + {0, 1}` of the 64 channels of the CTA
+                    constexpr uint32_t kNumThreadChannelPairs = WGMMA::kNumAccum / 8;
+                    float2 activations[2][kNumThreadChannelPairs];
+                    float amax[2];
 
-                        // 64B swizzling: 16-byte chunk `c` of token row `t` is at `c ^ ((t / 2) % 4)`; each further 64-row tile adds 2 chunks
-                        const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d[pipeline_idx].l1) + token_idx * L1_OUT_BLOCK_N +
-                            (((channel_idx / kNumBankGroupBytes + t * 2) ^ ((token_idx / 2) % 4)) * kNumBankGroupBytes) + channel_idx % kNumBankGroupBytes;
-                        smem_ptr[0] = static_cast<uint8_t>(fp8x2.__x);
-                        smem_ptr[L1_OUT_BLOCK_N] = static_cast<uint8_t>(fp8x2.__x >> 8);
+                    #pragma unroll
+                    for (uint32_t r = 0; r < 2; ++ r) {
+                        float weight = 1.0f;
+                        if (not is_shared)
+                            weight = buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + token_idx + r * 8];
+                        amax[r] = 0.0f;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumThreadChannelPairs; ++ i) {
+                            activations[r][i] = apply_swiglu({final_accum[0][i * 8 + r * 2 + 0], final_accum[0][i * 8 + r * 2 + 1]},
+                                                             {final_accum[0][i * 8 + r * 2 + 4], final_accum[0][i * 8 + r * 2 + 5]},
+                                                             {weight, weight});
+                            amax[r] = fmaxf(amax[r], fmaxf(fabsf(activations[r][i].x), fabsf(activations[r][i].y)));
+                        }
+
+                        // All 64 channels of a token are in its quad
+                        amax[r] = math::warp_reduce<4, false>(amax[r], math::ReduceMax<float>());
+                    }
+
+                    // Every warp sends the amax of its 16 tokens to the peer CTA, whose barrier takes all of them
+                    // NOTES: only thread 0 sets the expected bytes, a transaction count may go negative until then
+                    // The complete-tx of `st.async` is a cluster-scope release, so it needs no fence
+                    if (epilogue_thread_idx == 0)
+                        peer_amax_full_barrier.arrive_and_expect_tx(BLOCK_M * sizeof(float), peer_cta_idx);
+                    if (quad_idx < 2) {
+                        ptx::st_async_cluster_u32(reinterpret_cast<float*>(shared_storage.peer_amax[0][amax_slot_idx]) + token_idx + quad_idx * 8,
+                                                  __float_as_uint(quad_idx == 0 ? amax[0] : amax[1]), peer_cta_idx, peer_amax_full_barrier);
+                    }
+                    peer_amax_full_barrier.wait(amax_slot_phase);
+                    ++ num_linear1_tasks;
+                    wait_l1_store();
+                    if (is_l2_staging_dirty)
+                        sync_epilogue();
+                    is_l2_staging_dirty = false;
+
+                    // Cast into FP8 E4M3 and store into shared memory, a thread writes 2 adjacent channels at once
+                    float sf[2];
+                    const auto peer_amax = reinterpret_cast<const float*>(shared_storage.peer_amax[0][amax_slot_idx]);
+                    #pragma unroll
+                    for (uint32_t r = 0; r < 2; ++ r) {
+                        sf[r] = get_sf(fmaxf(amax[r], ptx::ld_shared(peer_amax + token_idx + r * 8)));
+                        const float sf_inv = get_sf_inv(sf[r]);
+
+                        // 64B swizzling: 16-byte chunk `c` of token row `t` is at `c ^ ((t / 2) % 4)`, with `(t / 2) % 4 = lane_idx / 8` here
+                        const auto smem_row = reinterpret_cast<uint8_t*>(shared_storage.smem_d[0].l1) + (token_idx + r * 8) * L1_OUT_BLOCK_N + quad_idx * 2;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumThreadChannelPairs; ++ i) {
+                            const auto fp8x2 = __nv_fp8x2_e4m3(make_float2(activations[r][i].x * sf_inv, activations[r][i].y * sf_inv));
+                            *reinterpret_cast<uint16_t*>(smem_row + ((i / 2) ^ (lane_idx / 8)) * kNumBankGroupBytes + (i % 2) * 8) = fp8x2.__x;
+                        }
+                    }
+
+                    // Hand the tile over to the store warp
+                    if (quad_idx < 2)
+                        ptx::st_shared(reinterpret_cast<float*>(shared_storage.amax_reduction[1]) + token_idx + quad_idx * 8, quad_idx == 0 ? sf[0] : sf[1]);
+                    if (epilogue_thread_idx == 0) {
+                        *reinterpret_cast<L1StoreCommand*>(shared_storage.amax_reduction[2]) =
+                            {0u, static_cast<uint32_t>(is_shared), n_block_idx, task_info.n_cluster_idx, m_idx, block_idx, ring_block_idx, pool_block_idx};
+                    }
+                    ordered_ptx::fence_view_async_shared();
+                    asm volatile("bar.arrive %0, %1;" :: "r"(kL1StoreFullBarrierIdx), "r"(kNumL1StoreBarrierThreads) : "memory");
+                    is_l1_store_pending = true;
+                } else {
+                    float2 activations[kNumRowTiles][WGMMA::kNumAccum / 4];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                        float2 weights = {1.0f, 1.0f};
+                        if (not is_shared)
+                            weights = *reinterpret_cast<const float2*>(buffer.l1_topk_weights_buffer.get_base_ptr<float>() + ring_m_idx + i * 8 + quad_idx * 2);
+
+                        #pragma unroll
+                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                            activations[t][i] = apply_swiglu({final_accum[t][i * 4 + 0], final_accum[t][i * 4 + 1]},
+                                                             {final_accum[t][i * 4 + 2], final_accum[t][i * 4 + 3]}, weights);
+                        }
+                    }
+
+                    // Reduce the per-token amax over the channels of the warp, then over the 64 channels of the CTA
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                        const auto reduce_amax = [&](const auto& get) {
+                            float amax = fabsf(get(activations[0][i]));
+                            #pragma unroll
+                            for (uint32_t t = 1; t < kNumRowTiles; ++ t)
+                                amax = fmaxf(amax, fabsf(get(activations[t][i])));
+                            return math::warp_reduce<4, true>(amax, math::ReduceMax<float>());
+                        };
+                        const float2 amax = {reduce_amax([](const float2& a) { return a.x; }), reduce_amax([](const float2& a) { return a.y; })};
+                        if (lane_idx < 4)
+                            ptx::st_shared(reinterpret_cast<float2*>(shared_storage.amax_reduction[math_warp_idx]) + i * 4 + lane_idx, amax);
+                    }
+                    sync_epilogue();
+
+                    // Thread `t < BLOCK_M / 4` reduces tokens `4t` to `4t + 3`, and sends them to the same pipeline of the peer CTA
+                    const auto amax_slot_idx = num_linear1_tasks % kNumAmaxSlots;
+                    const auto amax_slot_phase = (num_linear1_tasks / kNumAmaxSlots) & 1;
+                    auto& peer_amax_full_barrier = shared_storage.peer_amax_full_barriers[pipeline_idx][amax_slot_idx];
+                    const auto peer_cta_idx = cta_rank_in_cluster ^ 1;
+                    if (epilogue_thread_idx < BLOCK_M / 4) {
+                        float4 amax = ptx::ld_shared(&shared_storage.amax_reduction[first_epilogue_warp_idx][epilogue_thread_idx]);
+                        #pragma unroll
+                        for (uint32_t i = 1; i < kNumEpilogueThreads / 32; ++ i) {
+                            const auto other = ptx::ld_shared(&shared_storage.amax_reduction[first_epilogue_warp_idx + i][epilogue_thread_idx]);
+                            amax = {fmaxf(amax.x, other.x), fmaxf(amax.y, other.y), fmaxf(amax.z, other.z), fmaxf(amax.w, other.w)};
+                        }
+                        shared_storage.amax_reduction[first_epilogue_warp_idx][epilogue_thread_idx] = amax;
+                        if (epilogue_thread_idx == 0)
+                            peer_amax_full_barrier.arrive_and_expect_tx(BLOCK_M * sizeof(float), peer_cta_idx);
+                        ptx::fence_acq_rel_cluster();
+                        ptx::st_async_cluster(&shared_storage.peer_amax[pipeline_idx][amax_slot_idx][epilogue_thread_idx], amax, peer_cta_idx, peer_amax_full_barrier);
+                    }
+                    sync_epilogue();
+                    peer_amax_full_barrier.wait(amax_slot_phase);
+                    ++ num_linear1_tasks;
+
+                    // The 128-channel amax of token `i`
+                    const auto get_amax = [&](const uint32_t& i) {
+                        const auto local_amax = reinterpret_cast<const float*>(shared_storage.amax_reduction[first_epilogue_warp_idx]);
+                        const auto peer_amax = reinterpret_cast<const float*>(shared_storage.peer_amax[pipeline_idx][amax_slot_idx]);
+                        return fmaxf(ptx::ld_shared(local_amax + i), ptx::ld_shared(peer_amax + i));
+                    };
+
+                    // Cast into FP8 E4M3 and store into shared memory
+                    const uint32_t channel_idx = first_row_tile_idx * (WGMMA::M / 2) + warp_idx_in_wg * 8 + lane_idx / 4;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                        const uint32_t token_idx = i * 8 + quad_idx * 2;
+                        const float2 sf_inv = {get_sf_inv(get_sf(get_amax(token_idx))), get_sf_inv(get_sf(get_amax(token_idx + 1)))};
+                        #pragma unroll
+                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                            const auto fp8x2 = __nv_fp8x2_e4m3(make_float2(activations[t][i].x * sf_inv.x, activations[t][i].y * sf_inv.y));
+
+                            // 64B swizzling: 16-byte chunk `c` of token row `t` is at `c ^ ((t / 2) % 4)`; each further 64-row tile adds 2 chunks
+                            const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d[pipeline_idx].l1) + token_idx * L1_OUT_BLOCK_N +
+                                (((channel_idx / kNumBankGroupBytes + t * 2) ^ ((token_idx / 2) % 4)) * kNumBankGroupBytes) + channel_idx % kNumBankGroupBytes;
+                            smem_ptr[0] = static_cast<uint8_t>(fp8x2.__x);
+                            smem_ptr[L1_OUT_BLOCK_N] = static_cast<uint8_t>(fp8x2.__x >> 8);
+                        }
+                    }
+
+                    // Store FP32 SF into `l2_sf_buffer` or `shared_l2_sf_buffer` (MN-major), only by the leader CTA
+                    if (is_leader_cta and epilogue_thread_idx < BLOCK_M) {
+                        const auto sf_ptr = is_shared ?
+                            buffer.shared_l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSharedSFTokens :
+                            buffer.l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSFRingTokens;
+                        sf_ptr[block_idx * SF_BLOCK_M + transform_sf_token_idx(epilogue_thread_idx)] = __float_as_uint(get_sf(get_amax(epilogue_thread_idx)));
                     }
                 }
 
-                // Store FP32 SF into `l2_sf_buffer` or `shared_l2_sf_buffer` (MN-major), only by the leader CTA
-                if (is_leader_cta and epilogue_thread_idx < BLOCK_M) {
-                    const auto sf_ptr = is_shared ?
-                        buffer.shared_l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSharedSFTokens :
-                        buffer.l2_sf_buffer.get_base_ptr<uint32_t>() + task_info.n_cluster_idx * kNumSFRingTokens;
-                    sf_ptr[block_idx * SF_BLOCK_M + transform_sf_token_idx(epilogue_thread_idx)] = __float_as_uint(get_sf(get_amax(epilogue_thread_idx)));
-                }
+                if constexpr (not kTokensOnM) {
+                    // Issue TMA store
+                    ordered_ptx::fence_view_async_shared();
+                    sync_epilogue();
+                    if (epilogue_thread_idx == 0) {
+                        const auto tensor_map_l1_output_ptr = is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output;
+                        cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, shared_storage.smem_d[pipeline_idx].l1, n_block_idx * L1_OUT_BLOCK_N, m_idx);
+                        cute::tma_store_arrive();
+                        ptx::tma_store_wait<0>();
+                    }
 
-                // Issue TMA store
-                ordered_ptx::fence_view_async_shared();
-                sync_epilogue();
-                if (epilogue_thread_idx == 0) {
-                    const auto tensor_map_l1_output_ptr = is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output;
-                    cute::SM90_TMA_STORE_2D::copy(tensor_map_l1_output_ptr, shared_storage.smem_d[pipeline_idx].l1, n_block_idx * L1_OUT_BLOCK_N, m_idx);
-                    cute::tma_store_arrive();
-                    ptx::tma_store_wait<0>();
-                }
-
-                // Notify L2 and increment L1 empty count
-                sync_epilogue();
-                if (epilogue_thread_idx == 0) {
-                    if (is_shared) {
-                        ordered_ptx::red_add_rel(workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
-                    } else {
-                        L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
-                        ordered_ptx::red_add_rel(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    // Notify L2 and increment L1 empty count
+                    sync_epilogue();
+                    if (epilogue_thread_idx == 0) {
+                        if (is_shared) {
+                            ordered_ptx::red_add_rel(workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
+                        } else {
+                            L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
+                            ordered_ptx::red_add_rel(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                        }
                     }
                 }
             } else {
@@ -1220,66 +1521,133 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const auto smem_d = reinterpret_cast<uint8_t*>(shared_storage.smem_d[pipeline_idx].l2[first_row_tile_idx]);
                 constexpr uint32_t kNumL2StoreTileBytes = STORE_BLOCK_M_L2 * kNumL2StoreRowBytes;
                 const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;
-                #pragma unroll
-                for (uint32_t s = 0; s < BLOCK_M / STORE_BLOCK_M_L2; ++ s) {
-                    if (s * STORE_BLOCK_M_L2 >= valid_m)
-                        break;
+                if constexpr (kTokensOnM) {
+                    wait_l1_store();
 
-                    // Wait shared memory release from the previous NVLink store
-                    if (s > 0)
-                        ordered_ptx::sync_aligned(128, kMathWGBarrierStartIdx + math_wg_idx);
+                    // A warp owns 16 whole token rows, so it stages them alone through 8 x 64 tiles, without block barriers
+                    constexpr uint32_t kNumWarpStoreBytes = 8 * kNumL2StoreRowBytes;
+                    DG_STATIC_ASSERT(kNumMathWarps * kNumWarpStoreBytes <= sizeof(SharedStorage::smem_d[0].l2), "Invalid L2 store staging size");
+                    const auto warp_smem_d = reinterpret_cast<uint8_t*>(shared_storage.smem_d[0].l2) + math_warp_idx * kNumWarpStoreBytes;
+                    const uint32_t first_token_idx = token_idx - lane_idx / 4;
 
-                    // Store into shared memory: 4 transposed 8x8 matrices per `stmatrix`, i.e. 2 token atoms by 2 row atoms
-                    #pragma unroll
-                    for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                    // Lane `i < 16` resolves the destination of token `i` once, null if not valid
+                    float4* dst_ptr = nullptr;
+                    if (lane_idx < 16 and first_token_idx + lane_idx < valid_m) {
+                        const auto [dst_rank_idx, dst_token_idx, dst_topk_idx] = is_shared ?
+                            layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + first_token_idx + lane_idx, kNumTopk) :
+                            *workspace.get_token_src_metadata_ptr(pool_m_idx + first_token_idx + lane_idx);
+                        const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx).get_data_buffer(dst_token_idx);
+                        dst_ptr = sym_buffer.map(math::advance_ptr<float4>(dst_token.get_base_ptr(), n_block_idx * BLOCK_N * static_cast<uint32_t>(sizeof(nv_bfloat16))), dst_rank_idx);
+                    }
+
+                    if (first_token_idx < valid_m) {
                         #pragma unroll
-                        for (uint32_t i = 0; i < STORE_BLOCK_M_L2 / 8; i += 2) {
-                            const uint32_t accum_idx = s * (STORE_BLOCK_M_L2 / 8) + i;
-                            const uint32_t row = (i + lane_idx / 16) * 8 + lane_idx % 8;
-                            const uint32_t col = warp_idx_in_wg * 2 + (lane_idx / 8) % 2;
-                            ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
-                                math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 0], final_accum[t][accum_idx * 4 + 1]),
-                                math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 2], final_accum[t][accum_idx * 4 + 3]),
-                                math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 4], final_accum[t][accum_idx * 4 + 5]),
-                                math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 6], final_accum[t][accum_idx * 4 + 7]),
-                                smem_d + t * kNumL2StoreTileBytes + row * kNumL2StoreRowBytes + (col ^ (row % 8)) * kNumBankGroupBytes
-                            );
+                        for (uint32_t r = 0; r < 2; ++ r) {
+                            #pragma unroll
+                            for (uint32_t c = 0; c < WGMMA::kNumAccum / 32; ++ c) {
+                                // A thread holds the fragment of `stmatrix` as it is: 4 matrices of 8 tokens x 8 channels per instruction
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 8; i += 4) {
+                                    const auto accum_idx = (c * 8 + i) * 4 + r * 2;
+                                    ptx::SM90_U32x4_STSM_N<uint32_t>::copy(
+                                        math::cast_into_bf16_and_pack(final_accum[0][accum_idx +  0], final_accum[0][accum_idx +  1]),
+                                        math::cast_into_bf16_and_pack(final_accum[0][accum_idx +  4], final_accum[0][accum_idx +  5]),
+                                        math::cast_into_bf16_and_pack(final_accum[0][accum_idx +  8], final_accum[0][accum_idx +  9]),
+                                        math::cast_into_bf16_and_pack(final_accum[0][accum_idx + 12], final_accum[0][accum_idx + 13]),
+                                        warp_smem_d + (lane_idx % 8) * kNumL2StoreRowBytes + ((i + lane_idx / 8) ^ (lane_idx % 8)) * kNumBankGroupBytes
+                                    );
+                                }
+                                __syncwarp();
+
+                                // 8 lanes write 128 bytes of one token row
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 8; i += 4) {
+                                    const uint32_t row = i + lane_idx / 8;
+                                    const auto packed = ptx::ld_shared(reinterpret_cast<const float4*>(
+                                        warp_smem_d + row * kNumL2StoreRowBytes + ((lane_idx % 8) ^ row) * kNumBankGroupBytes));
+                                    const auto row_dst_ptr = reinterpret_cast<float4*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(dst_ptr), r * 8 + row));
+                                    if (row_dst_ptr != nullptr)
+                                        row_dst_ptr[c * 8 + lane_idx % 8] = packed;
+                                }
+                                __syncwarp();
+                            }
                         }
                     }
-                    ordered_ptx::sync_aligned(128, kMathWGBarrierStartIdx + math_wg_idx);
-
-                    // Write into remote buffers
+                } else {
                     #pragma unroll
-                    for (uint32_t i = 0; i < STORE_BLOCK_M_L2 / 16; ++ i) {
-                        const uint32_t row = i * 16 + warp_idx_in_wg * 4 + lane_idx / 8;
-                        const uint32_t m_idx_in_block = s * STORE_BLOCK_M_L2 + row;
-                        if (m_idx_in_block >= valid_m)
+                    for (uint32_t s = 0; s < BLOCK_M / STORE_BLOCK_M_L2; ++ s) {
+                        if (s * STORE_BLOCK_M_L2 >= valid_m)
                             break;
 
-                        // Shared experts write the extra combine slot `kNumTopk` of their own tokens
-                        const auto [dst_rank_idx, dst_token_idx, dst_topk_idx] = is_shared ?
-                            layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
-                            *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
-                        const auto packed = ptx::ld_shared(reinterpret_cast<const float4*>(
-                            smem_d + row * kNumL2StoreRowBytes + ((lane_idx % 8) ^ (row % 8)) * kNumBankGroupBytes));
-                        const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx).get_data_buffer(dst_token_idx);
-                        const auto dst_ptr = math::advance_ptr<float4>(
-                            dst_token.get_base_ptr(),
-                            (n_block_idx * BLOCK_N + first_row_tile_idx * WGMMA::M) * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
-                            (lane_idx % 8) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        // Wait shared memory release from the previous NVLink store
+                        if (s > 0)
+                            ordered_ptx::sync_aligned(128, kMathWGBarrierStartIdx + math_wg_idx);
 
-                        // The second tile holds the next 64 channels
-                        if constexpr (kNumRowTiles > 1) {
-                            *sym_buffer.map(dst_ptr + kNumL2StoreRowBytes / sizeof(float4), dst_rank_idx) = ptx::ld_shared(reinterpret_cast<const float4*>(
-                                smem_d + kNumL2StoreTileBytes + row * kNumL2StoreRowBytes + ((lane_idx % 8) ^ (row % 8)) * kNumBankGroupBytes));
+                        // Store into shared memory: 4 transposed 8x8 matrices per `stmatrix`, i.e. 2 token atoms by 2 row atoms
+                        #pragma unroll
+                        for (uint32_t t = 0; t < kNumRowTiles; ++ t) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < STORE_BLOCK_M_L2 / 8; i += 2) {
+                                const uint32_t accum_idx = s * (STORE_BLOCK_M_L2 / 8) + i;
+                                const uint32_t row = (i + lane_idx / 16) * 8 + lane_idx % 8;
+                                const uint32_t col = warp_idx_in_wg * 2 + (lane_idx / 8) % 2;
+                                ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
+                                    math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 0], final_accum[t][accum_idx * 4 + 1]),
+                                    math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 2], final_accum[t][accum_idx * 4 + 3]),
+                                    math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 4], final_accum[t][accum_idx * 4 + 5]),
+                                    math::cast_into_bf16_and_pack(final_accum[t][accum_idx * 4 + 6], final_accum[t][accum_idx * 4 + 7]),
+                                    smem_d + t * kNumL2StoreTileBytes + row * kNumL2StoreRowBytes + (col ^ (row % 8)) * kNumBankGroupBytes
+                                );
+                            }
+                        }
+                        ordered_ptx::sync_aligned(128, kMathWGBarrierStartIdx + math_wg_idx);
+
+                        // Write into remote buffers
+                        #pragma unroll
+                        for (uint32_t i = 0; i < STORE_BLOCK_M_L2 / 16; ++ i) {
+                            const uint32_t row = i * 16 + warp_idx_in_wg * 4 + lane_idx / 8;
+                            const uint32_t m_idx_in_block = s * STORE_BLOCK_M_L2 + row;
+                            if (m_idx_in_block >= valid_m)
+                                break;
+
+                            // Shared experts write the extra combine slot `kNumTopk` of their own tokens
+                            const auto [dst_rank_idx, dst_token_idx, dst_topk_idx] = is_shared ?
+                                layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
+                                *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                            const auto packed = ptx::ld_shared(reinterpret_cast<const float4*>(
+                                smem_d + row * kNumL2StoreRowBytes + ((lane_idx % 8) ^ (row % 8)) * kNumBankGroupBytes));
+                            const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx).get_data_buffer(dst_token_idx);
+                            const auto dst_ptr = math::advance_ptr<float4>(
+                                dst_token.get_base_ptr(),
+                                (n_block_idx * BLOCK_N + first_row_tile_idx * WGMMA::M) * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
+                                (lane_idx % 8) * static_cast<uint32_t>(sizeof(float4)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+
+                            // The second tile holds the next 64 channels
+                            if constexpr (kNumRowTiles > 1) {
+                                *sym_buffer.map(dst_ptr + kNumL2StoreRowBytes / sizeof(float4), dst_rank_idx) = ptx::ld_shared(reinterpret_cast<const float4*>(
+                                    smem_d + kNumL2StoreTileBytes + row * kNumL2StoreRowBytes + ((lane_idx % 8) ^ (row % 8)) * kNumBankGroupBytes));
+                            }
                         }
                     }
                 }
 
                 // Ensure the next epilogue safe to use shared memory
-                sync_epilogue();
+                // NOTES: with tokens on M, L2 tasks stage in per-warp slots, so only an L1 tile needs this
+                if constexpr (kTokensOnM) {
+                    is_l2_staging_dirty = true;
+                } else {
+                    sync_epilogue();
+                }
             }
+        }
+
+        // Stop the store warp
+        if constexpr (kTokensOnM) {
+            wait_l1_store();
+            if (epilogue_thread_idx == 0)
+                reinterpret_cast<L1StoreCommand*>(shared_storage.amax_reduction[2])->is_stop = 1;
+            asm volatile("bar.arrive %0, %1;" :: "r"(kL1StoreFullBarrierIdx), "r"(kNumL1StoreBarrierThreads) : "memory");
         }
 
         // Combine: reduce top-k results and write back
